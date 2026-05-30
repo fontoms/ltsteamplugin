@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import threading
 import time
+import urllib.parse
 import zipfile
 from datetime import datetime
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from downloads import fetch_app_name
 from http_client import ensure_http_client
@@ -66,6 +69,167 @@ def _is_safe_path(base_path: str, target_path: str) -> bool:
     abs_base = os.path.abspath(base_path)
     abs_target = os.path.abspath(os.path.join(base_path, target_path))
     return abs_target.startswith(abs_base + os.sep) or abs_target == abs_base
+
+
+def _find_7zip() -> Optional[str]:
+    """Locate 7-Zip executable on Windows."""
+    import shutil
+    for candidate in [
+        r"C:\Program Files\7-Zip\7z.exe",
+        r"C:\Program Files (x86)\7-Zip\7z.exe",
+    ]:
+        if os.path.isfile(candidate):
+            return candidate
+    return shutil.which("7z") or shutil.which("7za")
+
+
+def _resolve_rootz_url(url: str, client) -> str:
+    """Resolve a rootz.so page URL to the actual file download URL."""
+    if "rootz.so" not in url:
+        return url
+    try:
+        resp = client.get(url, follow_redirects=True, timeout=20)
+        content_type = resp.headers.get("content-type", "").lower()
+        content_disp = resp.headers.get("content-disposition", "").lower()
+        # Already a direct file download
+        if "text/html" not in content_type or "attachment" in content_disp:
+            logger.log(f"LuaTools: rootz.so resolved directly to file: {resp.url}")
+            return str(resp.url)
+        html = resp.text
+        # Try common patterns for download links in the page
+        patterns = [
+            r'<a[^>]+href="([^"]+)"[^>]*>\s*[Dd]ownload',
+            r'data-(?:download-)?url="([^"]+)"',
+            r'"download(?:Url|URL|_url)"\s*:\s*"([^"]+)"',
+            r'href="([^"]+(?:\.rar|\.zip|\.7z)(?:\?[^"]*)?)"',
+            r'action="(/[^"]+)"[^>]+method="(?:get|GET)"',
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, html, re.IGNORECASE)
+            if m:
+                found = m.group(1)
+                if not found.startswith("http"):
+                    found = urllib.parse.urljoin(str(resp.url), found)
+                logger.log(f"LuaTools: rootz.so resolved via HTML pattern to: {found}")
+                return found
+    except Exception as exc:
+        logger.warn(f"LuaTools: rootz.so URL resolution failed for {url}: {exc}")
+    return url
+
+
+def _extract_rar_to_dir(archive_path: str, install_path: str, appid: int, password: str = "") -> List[str]:
+    """Extract a RAR archive into install_path (mirrors ZIP extraction logic). Returns relative extracted paths."""
+    sevenzip = _find_7zip()
+    if not sevenzip:
+        try:
+            import rarfile
+            return _extract_rar_via_rarfile(archive_path, install_path, appid, password)
+        except ImportError:
+            raise RuntimeError(
+                "Cannot extract RAR archive: 7-Zip not found and rarfile package unavailable. "
+                "Please install 7-Zip from https://www.7-zip.org/"
+            )
+
+    # Use a temporary subfolder so we can inspect the top-level layout
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(dir=os.path.dirname(archive_path))
+    try:
+        cmd = [sevenzip, "x", archive_path, f"-o{tmp_dir}", "-y"]
+        if password:
+            cmd.append(f"-p{password}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode not in (0, 1):  # 7z exits 1 for some warnings
+            raise RuntimeError(f"7z extraction failed (code {result.returncode}): {result.stderr.strip()}")
+
+        # Collect extracted items and determine top-level entries
+        all_files: List[str] = []
+        for root, dirs, files in os.walk(tmp_dir):
+            for f in files:
+                full = os.path.join(root, f)
+                rel = os.path.relpath(full, tmp_dir).replace("\\", "/")
+                all_files.append(rel)
+
+        top_level = {p.split("/")[0] for p in all_files if p.split("/")[0]}
+        appid_folder = str(appid)
+        extracted_files: List[str] = []
+
+        # If single top-level folder matching appid, strip it (mirrors ZIP logic)
+        if len(top_level) == 1 and appid_folder in top_level:
+            logger.log(f"LuaTools: RAR has single appid folder, stripping prefix {appid_folder}")
+            for rel in all_files:
+                stripped = "/".join(rel.split("/")[1:])
+                if not stripped:
+                    continue
+                if not _is_safe_path(install_path, stripped):
+                    logger.warn(f"LuaTools: Skipping unsafe RAR path: {stripped}")
+                    continue
+                src = os.path.join(tmp_dir, rel.replace("/", os.sep))
+                dst = os.path.join(install_path, stripped.replace("/", os.sep))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                import shutil as _shutil
+                _shutil.copy2(src, dst)
+                extracted_files.append(stripped)
+        else:
+            import shutil as _shutil
+            for rel in all_files:
+                if not _is_safe_path(install_path, rel):
+                    logger.warn(f"LuaTools: Skipping unsafe RAR path: {rel}")
+                    continue
+                src = os.path.join(tmp_dir, rel.replace("/", os.sep))
+                dst = os.path.join(install_path, rel.replace("/", os.sep))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                _shutil.copy2(src, dst)
+                extracted_files.append(rel)
+
+        return extracted_files
+    finally:
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _extract_rar_via_rarfile(archive_path: str, install_path: str, appid: int, password: str = "") -> List[str]:
+    """Fallback RAR extraction using the rarfile package."""
+    import rarfile
+    pwd = password.encode("utf-8") if password else None
+    extracted_files: List[str] = []
+    appid_folder = f"{appid}/"
+
+    with rarfile.RarFile(archive_path, "r") as rf:
+        all_names = [info.filename.replace("\\", "/") for info in rf.infolist() if not info.is_dir()]
+        top_level = {n.split("/")[0] for n in all_names if n.split("/")[0]}
+
+        if len(top_level) == 1 and appid_folder.rstrip("/") in top_level:
+            for member in rf.infolist():
+                fname = member.filename.replace("\\", "/")
+                if not fname.startswith(appid_folder) or fname == appid_folder or member.is_dir():
+                    continue
+                target_path = fname[len(appid_folder):]
+                if not target_path or not _is_safe_path(install_path, target_path):
+                    continue
+                data = rf.read(member, pwd=pwd)
+                dst = os.path.join(install_path, target_path.replace("/", os.sep))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(dst, "wb") as f:
+                    f.write(data)
+                extracted_files.append(target_path)
+        else:
+            for member in rf.infolist():
+                if member.is_dir():
+                    continue
+                fname = member.filename.replace("\\", "/")
+                if not _is_safe_path(install_path, fname):
+                    continue
+                data = rf.read(member, pwd=pwd)
+                dst = os.path.join(install_path, fname.replace("/", os.sep))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(dst, "wb") as f:
+                    f.write(data)
+                extracted_files.append(fname)
+
+    return extracted_files
 
 
 def _set_fix_download_state(appid: int, update: dict) -> None:
@@ -160,22 +324,39 @@ def check_for_fixes(appid: int) -> str:
     return json.dumps(result)
 
 
-def _download_and_extract_fix(appid: int, download_url: str, install_path: str, fix_type: str, game_name: str = ""):
+def _download_and_extract_fix(appid: int, download_url: str, install_path: str, fix_type: str, game_name: str = "", archive_password: str = ""):
     client = ensure_http_client("LuaTools: fix download")
+    dest_file: str = ""
     try:
         dest_root = ensure_temp_download_dir()
-        dest_zip = os.path.join(dest_root, f"fix_{appid}.zip")
         _set_fix_download_state(appid, {"status": "downloading", "bytesRead": 0, "totalBytes": 0, "error": None})
 
-        logger.log(f"LuaTools: Downloading {fix_type} from {download_url}")
+        # Resolve intermediate hoster pages (e.g. rootz.so) to the actual file URL
+        resolved_url = _resolve_rootz_url(download_url, client)
+        if resolved_url != download_url:
+            logger.log(f"LuaTools: URL resolved from {download_url} -> {resolved_url}")
 
-        with client.stream("GET", download_url, follow_redirects=True, timeout=30) as resp:
+        logger.log(f"LuaTools: Downloading {fix_type} from {resolved_url}")
+
+        with client.stream("GET", resolved_url, follow_redirects=True, timeout=30) as resp:
             logger.log(f"LuaTools: Fix download response for {appid}: status={resp.status_code}")
             resp.raise_for_status()
             total = int(resp.headers.get("Content-Length", "0") or "0")
             _set_fix_download_state(appid, {"totalBytes": total})
 
-            with open(dest_zip, "wb") as output:
+            # Detect extension from Content-Disposition or URL
+            content_disp = resp.headers.get("content-disposition", "")
+            cd_match = re.search(r'filename="?([^";]+)"?', content_disp, re.IGNORECASE)
+            if cd_match:
+                ext = os.path.splitext(cd_match.group(1).strip())[1].lower() or ".zip"
+            else:
+                ext = os.path.splitext(str(resp.url).split("?")[0])[1].lower() or ".zip"
+            if ext not in (".zip", ".rar", ".7z"):
+                ext = ".zip"
+
+            dest_file = os.path.join(dest_root, f"fix_{appid}{ext}")
+
+            with open(dest_file, "wb") as output:
                 for chunk in resp.iter_bytes():
                     if not chunk:
                         continue
@@ -190,59 +371,66 @@ def _download_and_extract_fix(appid: int, download_url: str, install_path: str, 
                         logger.log(f"LuaTools: Fix download cancelled for {appid}")
                         raise RuntimeError("cancelled")
 
-        logger.log(f"LuaTools: Download complete, extracting to {install_path}")
+        logger.log(f"LuaTools: Download complete ({ext}), extracting to {install_path}")
         _set_fix_download_state(appid, {"status": "extracting"})
 
         extracted_files = []
-        with zipfile.ZipFile(dest_zip, "r") as archive:
-            all_names = archive.namelist()
+
+        if ext == ".rar":
+            # RAR extraction via 7-Zip or rarfile
+            logger.log(f"LuaTools: Extracting RAR archive with password={'yes' if archive_password else 'no'}")
+            extracted_files = _extract_rar_to_dir(dest_file, install_path, appid, archive_password)
+        else:
+            # ZIP extraction (existing logic preserved)
             appid_folder = f"{appid}/"
+            pwd_bytes = archive_password.encode("utf-8") if archive_password else None
 
-            top_level_entries = set()
-            for name in all_names:
-                parts = name.split("/")
-                if parts[0]:
-                    top_level_entries.add(parts[0])
-            if _get_fix_download_state(appid).get("status") == "cancelled":
-                logger.log(f"LuaTools: Fix extraction cancelled before start for {appid}")
-                raise RuntimeError("cancelled")
+            with zipfile.ZipFile(dest_file, "r") as archive:
+                all_names = archive.namelist()
 
-            if len(top_level_entries) == 1 and appid_folder.rstrip("/") in top_level_entries:
-                logger.log(f"LuaTools: Found single folder {appid} in zip, extracting its contents")
-                for member in archive.namelist():
-                    if member.startswith(appid_folder) and member != appid_folder:
-                        target_path = member[len(appid_folder):]
-                        if not target_path:
+                top_level_entries = set()
+                for name in all_names:
+                    parts = name.split("/")
+                    if parts[0]:
+                        top_level_entries.add(parts[0])
+                if _get_fix_download_state(appid).get("status") == "cancelled":
+                    logger.log(f"LuaTools: Fix extraction cancelled before start for {appid}")
+                    raise RuntimeError("cancelled")
+
+                if len(top_level_entries) == 1 and appid_folder.rstrip("/") in top_level_entries:
+                    logger.log(f"LuaTools: Found single folder {appid} in zip, extracting its contents")
+                    for member in archive.namelist():
+                        if member.startswith(appid_folder) and member != appid_folder:
+                            target_path = member[len(appid_folder):]
+                            if not target_path:
+                                continue
+                            if not _is_safe_path(install_path, target_path):
+                                logger.warn(f"LuaTools: Skipping potentially unsafe path in zip: {member}")
+                                continue
+                            source = archive.open(member, pwd=pwd_bytes)
+                            target = os.path.join(install_path, target_path)
+                            os.makedirs(os.path.dirname(target), exist_ok=True)
+                            if not member.endswith("/"):
+                                with open(target, "wb") as output:
+                                    output.write(source.read())
+                                extracted_files.append(target_path.replace("\\", "/"))
+                            source.close()
+                            if _get_fix_download_state(appid).get("status") == "cancelled":
+                                logger.log(f"LuaTools: Fix extraction cancelled mid-process for {appid}")
+                                raise RuntimeError("cancelled")
+                else:
+                    logger.log(f"LuaTools: Extracting all zip contents to {install_path}")
+                    for member in archive.namelist():
+                        if member.endswith("/"):
                             continue
-                        # Validate path doesn't escape install directory (prevent path traversal)
-                        if not _is_safe_path(install_path, target_path):
+                        if not _is_safe_path(install_path, member):
                             logger.warn(f"LuaTools: Skipping potentially unsafe path in zip: {member}")
                             continue
-                        source = archive.open(member)
-                        target = os.path.join(install_path, target_path)
-                        os.makedirs(os.path.dirname(target), exist_ok=True)
-                        if not member.endswith("/"):
-                            with open(target, "wb") as output:
-                                output.write(source.read())
-                            extracted_files.append(target_path.replace("\\", "/"))
-                        source.close()
+                        archive.extract(member, install_path, pwd=pwd_bytes)
+                        extracted_files.append(member.replace("\\", "/"))
                         if _get_fix_download_state(appid).get("status") == "cancelled":
                             logger.log(f"LuaTools: Fix extraction cancelled mid-process for {appid}")
                             raise RuntimeError("cancelled")
-            else:
-                logger.log(f"LuaTools: Extracting all zip contents to {install_path}")
-                for member in archive.namelist():
-                    if member.endswith("/"):
-                        continue
-                    # Validate path doesn't escape install directory (prevent path traversal)
-                    if not _is_safe_path(install_path, member):
-                        logger.warn(f"LuaTools: Skipping potentially unsafe path in zip: {member}")
-                        continue
-                    archive.extract(member, install_path)
-                    extracted_files.append(member.replace("\\", "/"))
-                    if _get_fix_download_state(appid).get("status") == "cancelled":
-                        logger.log(f"LuaTools: Fix extraction cancelled mid-process for {appid}")
-                        raise RuntimeError("cancelled")
 
         if _get_fix_download_state(appid).get("status") == "cancelled":
             logger.log(f"LuaTools: Fix cancelled after extraction for {appid}")
@@ -314,15 +502,15 @@ def _download_and_extract_fix(appid: int, download_url: str, install_path: str, 
         _set_fix_download_state(appid, {"status": "done", "success": True})
 
         try:
-            os.remove(dest_zip)
+            os.remove(dest_file)
         except Exception:
             pass
 
     except Exception as exc:
         if str(exc) == "cancelled":
             try:
-                if os.path.exists(dest_zip):
-                    os.remove(dest_zip)
+                if dest_file and os.path.exists(dest_file):
+                    os.remove(dest_file)
             except Exception:
                 pass
             _set_fix_download_state(appid, {"status": "cancelled", "success": False, "error": "Cancelled by user"})
@@ -331,7 +519,7 @@ def _download_and_extract_fix(appid: int, download_url: str, install_path: str, 
         _set_fix_download_state(appid, {"status": "failed", "error": str(exc)})
 
 
-def apply_game_fix(appid: int, download_url: str, install_path: str, fix_type: str = "", game_name: str = "") -> str:
+def apply_game_fix(appid: int, download_url: str, install_path: str, fix_type: str = "", game_name: str = "", archive_password: str = "") -> str:
     try:
         appid = int(appid)
     except Exception:
@@ -347,7 +535,7 @@ def apply_game_fix(appid: int, download_url: str, install_path: str, fix_type: s
 
     _set_fix_download_state(appid, {"status": "queued", "bytesRead": 0, "totalBytes": 0, "error": None})
     thread = threading.Thread(
-        target=_download_and_extract_fix, args=(appid, download_url, install_path, fix_type, game_name), daemon=True
+        target=_download_and_extract_fix, args=(appid, download_url, install_path, fix_type, game_name, archive_password), daemon=True
     )
     thread.start()
 
@@ -362,8 +550,8 @@ def get_apply_fix_status(appid: int) -> str:
 
     state = _get_fix_download_state(appid)
     return json.dumps({"success": True, "state": state})
- 
- 
+
+
 def cancel_apply_fix(appid: int) -> str:
     try:
         appid = int(appid)
